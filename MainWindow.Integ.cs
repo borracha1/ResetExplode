@@ -30,7 +30,8 @@ public partial class MainWindow
     private readonly Dictionary<string, List<LightDevice>> _devsByBackend = new();
     private List<LightDeviceVm> _lightVms = new();
     private DispatcherTimer? _lightTimer;
-    private bool _lightRunning, _lightBusy, _lightInited;
+    private bool _lightRunning, _lightBusy, _lightInited, _lightLoading, _lightRename;
+    private readonly Dictionary<string, LightDevice> _lightControlled = new();
     private string _effect = "static";
     private (byte R, byte G, byte B) _lightColor = (255, 255, 255);
     private readonly Stopwatch _lightClock = Stopwatch.StartNew();
@@ -73,7 +74,8 @@ public partial class MainWindow
         }
         _lightTimer = new DispatcherTimer(DispatcherPriority.Render) { Interval = TimeSpan.FromMilliseconds(33) };
         _lightTimer.Tick += LightTick;
-        LightColor_Changed(null, null!);
+        ApplyLightProfile();
+        RefreshLightProfiles();
         BtnOrgbOpen.Content = FindOpenRgb() != null ? "ABRIR O OPENRGB" : "BAIXAR O OPENRGB";
         _ = ConnectAllAsync(); // primeira abertura da aba: tenta conectar em tudo
     }
@@ -88,11 +90,201 @@ public partial class MainWindow
         return new ControlTemplate(typeof(Button)) { VisualTree = border };
     }
 
+    // ---------------- Perfis ----------------
+
+    private void ApplyLightProfile()
+    {
+        _lightLoading = true;
+        try
+        {
+            var p = LightProfiles.Active(_settings);
+            _effect = p.Effect;
+            foreach (var radio in LightFxPanel.Children.OfType<RadioButton>())
+                radio.IsChecked = (string)radio.Tag == p.Effect;
+            LightR.Value = p.R; LightG.Value = p.G; LightB.Value = p.B;
+            LightBright.Value = p.Brightness; LightSpeed.Value = p.Speed;
+            LightExclusive.IsChecked = p.Exclusive;
+            RebuildLightList();
+            LightColor_Changed(null, null!);
+            _smoothValue = float.NaN;
+        }
+        finally { _lightLoading = false; }
+        UpdateLightKeep();
+    }
+
+    private void RefreshLightProfiles()
+    {
+        _lightLoading = true;
+        try
+        {
+            LightProfilePicker.ItemsSource = null;
+            LightProfilePicker.ItemsSource = _settings.LightProfiles;
+            LightProfilePicker.SelectedItem = LightProfiles.Active(_settings);
+            BtnLightProfileDelete.IsEnabled = _settings.LightProfiles.Count > 1;
+        }
+        finally { _lightLoading = false; }
+    }
+
+    private void SaveLightSettings()
+    {
+        try { _settings.Save(); }
+        catch (Exception ex)
+        {
+            LightRunHint.Text = "Não consegui salvar os perfis: " + ex.Message;
+            Diag(LightRunHint.Text);
+        }
+    }
+
+    private void SaveLightProfile()
+    {
+        if (!_lightInited || _lightLoading) return;
+        var p = LightProfiles.Active(_settings);
+        p.Effect = _effect;
+        p.R = (byte)LightR.Value; p.G = (byte)LightG.Value; p.B = (byte)LightB.Value;
+        p.Brightness = LightBright.Value; p.Speed = LightSpeed.Value;
+        p.Exclusive = LightExclusive.IsChecked == true;
+        // Mantém também as escolhas dos dispositivos desconectados.
+        var unselected = p.Unselected.ToHashSet();
+        foreach (var vm in _lightVms)
+        {
+            if (vm.Selected) unselected.Remove(vm.Device.Key);
+            else unselected.Add(vm.Device.Key);
+        }
+        p.Unselected = unselected.OrderBy(key => key, StringComparer.Ordinal).ToList();
+        SaveLightSettings();
+    }
+
+    private void LightProfile_Changed(object sender, SelectionChangedEventArgs e)
+    {
+        if (!_lightInited || _lightLoading || LightProfilePicker.SelectedItem is not LightProfile p) return;
+        bool running = _lightRunning;
+        if (running) StopLighting(true);
+        _settings.LightProfileActive = p.Name;
+        LightProfileEditor.Visibility = Visibility.Collapsed;
+        ApplyLightProfile();
+        SaveLightSettings();
+        if (running) StartLighting();
+    }
+
+    private void EditLightProfileName(bool rename)
+    {
+        _lightRename = rename;
+        LightProfileNameLabel.Text = rename ? "RENOMEAR PERFIL" : "NOVO PERFIL · CÓPIA DO ATUAL";
+        LightProfileName.Text = rename ? LightProfiles.Active(_settings).Name : "";
+        LightProfileNameError.Text = "";
+        LightProfileEditor.Visibility = Visibility.Visible;
+        LightProfileName.Focus();
+        LightProfileName.SelectAll();
+    }
+
+    private void BtnLightProfileNew_Click(object sender, RoutedEventArgs e) => EditLightProfileName(false);
+    private void BtnLightProfileRename_Click(object sender, RoutedEventArgs e) => EditLightProfileName(true);
+    private void BtnLightProfileCancel_Click(object sender, RoutedEventArgs e) => LightProfileEditor.Visibility = Visibility.Collapsed;
+
+    private void BtnLightProfileConfirm_Click(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            if (_lightRename) LightProfiles.Rename(_settings, LightProfiles.Active(_settings), LightProfileName.Text);
+            else LightProfiles.Create(_settings, LightProfileName.Text);
+        }
+        catch (ArgumentException ex) { LightProfileNameError.Text = ex.Message; return; }
+        LightProfileEditor.Visibility = Visibility.Collapsed;
+        RefreshLightProfiles();
+        SaveLightSettings();
+    }
+
+    private void LightProfileName_KeyDown(object sender, System.Windows.Input.KeyEventArgs e)
+    {
+        if (e.Key == System.Windows.Input.Key.Enter) { BtnLightProfileConfirm_Click(sender, e); e.Handled = true; }
+        else if (e.Key == System.Windows.Input.Key.Escape) { LightProfileEditor.Visibility = Visibility.Collapsed; e.Handled = true; }
+    }
+
+    private void BtnLightProfileDelete_Click(object sender, RoutedEventArgs e)
+    {
+        if (_settings.LightProfiles.Count <= 1) return;
+        var p = LightProfiles.Active(_settings);
+        if (MessageBox.Show(this, $"Excluir o perfil \"{p.Name}\"?", "RESET EXPLODE · Iluminação",
+            MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes) return;
+        bool running = _lightRunning;
+        if (running) StopLighting(true);
+        LightProfiles.Delete(_settings, p);
+        LightProfileEditor.Visibility = Visibility.Collapsed;
+        ApplyLightProfile();
+        RefreshLightProfiles();
+        SaveLightSettings();
+        if (running) StartLighting();
+    }
+
+    private void LightDevice_Click(object sender, RoutedEventArgs e)
+    {
+        if (!_lightInited || _lightLoading) return;
+        if (sender is CheckBox { DataContext: LightDeviceVm vm } box) vm.Selected = box.IsChecked == true;
+        SaveLightProfile();
+        RestartLightControl();
+    }
+
+    private void LightExclusive_Click(object sender, RoutedEventArgs e)
+    {
+        SaveLightProfile();
+        RestartLightControl();
+    }
+
+    private void RestartLightControl()
+    {
+        if (_lightRunning) { StopLighting(true); StartLighting(); }
+        UpdateLightKeep();
+    }
+
+    private void UpdateLightKeep()
+    {
+        if (BtnLightKeep == null) return;
+        bool fixedEffect = _effect is "static" or "off";
+        bool openRgb = _lightVms.Any(v => v.Selected && v.Device.Backend == _orgb && v.Device.LedCount > 0);
+        BtnLightKeep.IsEnabled = _lightRunning && fixedEffect && openRgb;
+        BtnLightKeep.ToolTip = !fixedEffect
+            ? "Respiração, Arco-íris e os efeitos de sensor precisam do app aberto"
+            : !_lightRunning ? "Ative o controle antes de deixar as cores no OpenRGB."
+            : !openRgb ? "Conecte e marque pelo menos um dispositivo OpenRGB com LEDs."
+            : "Deixa as cores e salva o perfil ResetExplode no OpenRGB (todos os controladores).";
+    }
+
+    private void BtnLightKeep_Click(object sender, RoutedEventArgs e)
+    {
+        if (!BtnLightKeep.IsEnabled || _orgb == null) return;
+        _lightTimer?.Stop();
+        LightOpenRgbGuide.Visibility = Visibility.Collapsed;
+        try
+        {
+            double bright = LightBright.Value / 100.0;
+            var color = _effect == "off" ? ((byte)0, (byte)0, (byte)0)
+                : ((byte)(_lightColor.R * bright), (byte)(_lightColor.G * bright), (byte)(_lightColor.B * bright));
+            foreach (var vm in _lightVms.Where(v => v.Selected && v.Device.Backend == _orgb && v.Device.LedCount > 0))
+            {
+                var d = vm.Device;
+                if (!_lightControlled.ContainsKey(d.Key)) throw new IOException("O OpenRGB não cedeu o controle de " + d.Name + ".");
+                var colors = Enumerable.Repeat(color, d.LedCount).ToArray();
+                if (_orgb.Send(d, colors) != 0) throw new IOException("Falha ao enviar as cores a " + d.Name + ".");
+            }
+            _orgb.SaveProfile("ResetExplode");
+            StopLighting(true, keepOpenRgb: true);
+            LightOpenRgbGuide.Visibility = Visibility.Visible;
+            Diag("OpenRGB · cores enviadas; solicitado SAVE_PROFILE ResetExplode (sem confirmação no protocolo).");
+        }
+        catch (Exception ex)
+        {
+            LightRunHint.Text = "Não consegui deixar no OpenRGB: " + ex.Message + " O controle continua ativo.";
+            Diag(LightRunHint.Text);
+            if (_lightRunning) _lightTimer?.Start();
+        }
+    }
+
     // ---------------- Conexões ----------------
 
     private async Task ConnectAllAsync()
     {
         if (_lightBusy) return;
+        if (_lightControlled.Count > 0) StopLighting(true);
         _lightBusy = true;
         BtnLightConnect.IsEnabled = false;
         try
@@ -106,13 +298,14 @@ public partial class MainWindow
 
     private void RebuildLightList()
     {
-        var keep = _lightVms.Where(v => !v.Selected).Select(v => v.Device.Key).ToHashSet();
+        var keep = LightProfiles.Active(_settings).Unselected.ToHashSet();
         _lightVms = _devsByBackend.Values.SelectMany(x => x)
             .Select(d => new LightDeviceVm { Device = d, Selected = !keep.Contains(d.Key) }).ToList();
         LightDevices.ItemsSource = _lightVms;
         LightDevicesHint.Text = _lightVms.Count == 0
             ? "Nenhum dispositivo encontrado ainda. Conecte pelo menos uma integração acima."
             : $"{_lightVms.Count} dispositivo(s), {_lightVms.Sum(v => v.Device.LedCount)} LEDs no total. Desmarque o que não quer controlar.";
+        UpdateLightKeep();
     }
 
     private async Task ConnectCorsairAsync()
@@ -302,9 +495,17 @@ public partial class MainWindow
     private void BtnLightRun_Click(object sender, RoutedEventArgs e)
     {
         if (_lightRunning) { StopLighting(true); return; }
+        StartLighting();
+    }
+
+    private void StartLighting()
+    {
+        // Pode haver uma sessão interrompida por desconexão do iCUE.
+        if (_lightControlled.Count > 0) StopLighting(true);
         var sel = _lightVms.Where(v => v.Selected && v.Device.LedCount > 0).ToList();
         if (sel.Count == 0) { LightRunHint.Text = "Conecte e marque pelo menos um dispositivo com LEDs."; return; }
         LightRunHint.Text = "";
+        LightOpenRgbGuide.Visibility = Visibility.Collapsed;
 
         var problems = new List<string>();
         bool exclusive = LightExclusive.IsChecked == true;
@@ -319,6 +520,7 @@ public partial class MainWindow
             int err = v.Device.Backend.Acquire(v.Device, exclusive);
             Diag($"Pedido de controle de \"{v.Name}\" ({v.Device.Backend.Name}): {v.Device.Backend.ErrorText(err)}");
             if (err != 0) problems.Add($"{v.Name}: {v.Device.Backend.ErrorText(err)}");
+            else _lightControlled[v.Device.Key] = v.Device;
         }
         _lightLast.Clear();
         _smoothValue = float.NaN;
@@ -328,22 +530,34 @@ public partial class MainWindow
             ? $"Controlando {sel.Count} dispositivo(s)."
             : "Controle ativo, mas com avisos: " + string.Join("; ", problems);
         _lightTimer!.Start();
+        UpdateLightKeep();
+        LightTick(null, EventArgs.Empty);
     }
 
-    private void StopLighting(bool release)
+    private void StopLighting(bool release, bool keepOpenRgb = false)
     {
         _lightTimer?.Stop();
         _lightRunning = false;
         BtnLightRun.Content = "ATIVAR CONTROLE";
         LightLive.Text = "";
+        UpdateLightKeep();
         if (!release) return;
         var backends = new HashSet<ILightBackend>();
-        foreach (var v in _lightVms.Where(v => v.Selected))
+        foreach (var d in _lightControlled.Values)
         {
-            try { v.Device.Backend.Release(v.Device); backends.Add(v.Device.Backend); } catch { }
+            try
+            {
+                if (keepOpenRgb && d.Backend is OpenRgbBackend orgb) orgb.Keep(d);
+                else d.Backend.Release(d);
+                backends.Add(d.Backend);
+            }
+            catch { }
         }
+        _lightControlled.Clear();
         foreach (var b in backends) { try { b.EndSession(); } catch { } }
-        LightRunHint.Text = "Controle devolvido: o iCUE, o OpenRGB e o Synapse reassumem as luzes.";
+        LightRunHint.Text = keepOpenRgb
+            ? "Cores deixadas no OpenRGB. O iCUE e o Synapse reassumem os demais dispositivos."
+            : "Controle devolvido: o iCUE, o OpenRGB e o Synapse reassumem as luzes.";
     }
 
     private void ShutdownInteg()
@@ -360,6 +574,9 @@ public partial class MainWindow
         _effect = (string)((FrameworkElement)sender).Tag;
         _smoothValue = float.NaN;
         _lightLast.Clear();
+        SaveLightProfile();
+        UpdateLightKeep();
+        if (_lightRunning && !_lightLoading) LightTick(null, EventArgs.Empty);
     }
 
     private void LightColor_Changed(object? sender, RoutedPropertyChangedEventArgs<double> e)
@@ -370,6 +587,7 @@ public partial class MainWindow
         LightBrightText.Text = $"{LightBright.Value:0}%";
         LightSpeedText.Text = $"{LightSpeed.Value:0}";
         _lightLast.Clear();
+        SaveLightProfile();
     }
 
     // ---------------- Efeitos ----------------
@@ -433,7 +651,7 @@ public partial class MainWindow
         long now = Environment.TickCount64;
         foreach (var vm in _lightVms)
         {
-            if (!vm.Selected || vm.Device.LedCount == 0) continue;
+            if (!vm.Selected || vm.Device.LedCount == 0 || !_lightControlled.ContainsKey(vm.Device.Key)) continue;
             var d = vm.Device;
             if (d.Backend == _corsair && (_cue == null || _cue.State != 6)) continue;
 

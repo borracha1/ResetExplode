@@ -1,5 +1,8 @@
 ## Novidades da v0.16
 
+**RESET FERRAMENTAS › Integração**
+- Perfis de iluminação com nome e salvamento automático; Cor fixa e Apagar podem ficar no OpenRGB sem o app aberto, com guia para carregar ao iniciar o Windows.
+
 **Nova página · RESET FERRAMENTAS › Inicialização**
 - Lista os programas que abrem junto com o Windows: chaves Run do registro (usuário, todos os usuários, 32 e 64 bits)
   e pastas Inicializar, com descrição, fabricante e aviso quando o arquivo do programa não existe mais.
