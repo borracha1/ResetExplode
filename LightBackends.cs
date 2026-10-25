@@ -73,6 +73,7 @@ public sealed class OpenRgbBackend : ILightBackend
     private NetworkStream? _ns;
     private int _proto = 3;
     private readonly Dictionary<string, (int Index, int ActiveMode, byte[]? ModeBytes)> _info = new();
+    private readonly HashSet<string> _kept = new();
 
     public string Name => "OpenRGB";
     public int MinIntervalMs => 25;
@@ -193,6 +194,7 @@ public sealed class OpenRgbBackend : ILightBackend
             Write(0, ReqControllerCount, Array.Empty<byte>());
             int count = (int)BitConverter.ToUInt32(ReadType(ReqControllerCount), 0);
             _info.Clear();
+            _kept.Clear();
             for (int i = 0; i < count; i++)
             {
                 Write((uint)i, ReqControllerData, BitConverter.GetBytes((uint)_proto));
@@ -221,9 +223,48 @@ public sealed class OpenRgbBackend : ILightBackend
         }
     }
 
+    /// <summary>Pacote SAVE_PROFILE (protocolo 2+), sem confirmação de gravação pelo servidor.</summary>
+    public static byte[] BuildSaveProfilePacket(string name)
+    {
+        if (string.IsNullOrWhiteSpace(name) || name.Any(c => c == '\0' || c > 127))
+            throw new ArgumentException("Use um nome ASCII não vazio, sem terminador nulo.");
+        var payload = Encoding.ASCII.GetBytes(name + "\0");
+        var packet = new byte[16 + payload.Length];
+        "ORGB"u8.CopyTo(packet);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(4), 0);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(8), 151);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(packet.AsSpan(12), (uint)payload.Length);
+        payload.CopyTo(packet, 16);
+        return packet;
+    }
+
+    public void SaveProfile(string name)
+    {
+        if (_ns == null || _proto < 2) throw new IOException("O servidor OpenRGB não está conectado ou é antigo demais.");
+        byte[] packet = BuildSaveProfilePacket(name);
+        _ns.Write(packet, 0, packet.Length);
+        _ns.Flush();
+    }
+
+    /// <summary>Esquece a restauração deste dispositivo; as cores ficam no OpenRGB.</summary>
+    public void Keep(LightDevice d) => _kept.Add(d.Id);
+
     public int Acquire(LightDevice d, bool exclusive)
     {
-        try { Write((uint)_info[d.Id].Index, SetCustomMode, Array.Empty<byte>()); return 0; }
+        try
+        {
+            int index = _info[d.Id].Index;
+            if (_kept.Contains(d.Id))
+            {
+                // Um novo controle deve devolver ao estado que deixamos, não ao antigo.
+                Write((uint)index, ReqControllerData, BitConverter.GetBytes((uint)_proto));
+                var current = Parse(ReadType(ReqControllerData));
+                _info[d.Id] = (index, current.Active, current.ModeBytes);
+            }
+            Write((uint)index, SetCustomMode, Array.Empty<byte>());
+            _kept.Remove(d.Id);
+            return 0;
+        }
         catch { return 1; }
     }
 
@@ -245,6 +286,7 @@ public sealed class OpenRgbBackend : ILightBackend
     /// <summary>Volta o dispositivo ao modo que estava ativo quando conectamos.</summary>
     public void Release(LightDevice d)
     {
+        if (_kept.Contains(d.Id)) return;
         try
         {
             var (idx, active, mode) = _info[d.Id];

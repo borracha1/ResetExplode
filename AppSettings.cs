@@ -67,6 +67,10 @@ public sealed class AppSettings
     public Dictionary<string, GameProfile> GameProfiles { get; set; } = new();
     public List<CustomGame> CustomGames { get; set; } = new();
 
+    // RESET INTEGRAÇÃO
+    public List<LightProfile> LightProfiles { get; set; } = new() { new LightProfile() };
+    public string? LightProfileActive { get; set; } = "Padrão";
+
     // Aparência
     public bool LightTheme { get; set; }
 
@@ -102,7 +106,11 @@ public sealed class AppSettings
         try
         {
             if (File.Exists(FilePath))
-                return JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(FilePath)) ?? new AppSettings();
+            {
+                var settings = JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(FilePath)) ?? new AppSettings();
+                ResetExplode.LightProfiles.Ensure(settings);
+                return settings;
+            }
         }
         catch { }
         return new AppSettings();
