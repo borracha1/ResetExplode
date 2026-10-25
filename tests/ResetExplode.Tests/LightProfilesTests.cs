@@ -113,6 +113,36 @@ public sealed class LightProfilesTests
     }
 
     [Fact]
+    public void AceitaNomeComQuarentaCaracteresDepoisDeAparar()
+    {
+        var settings = new AppSettings();
+        string name = new('x', 40);
+        Assert.Equal(name, LightProfiles.Create(settings, "  " + name + "  ").Name);
+    }
+
+    [Theory]
+    [InlineData("{\"LightProfiles\":[],\"LightProfileActive\":\"apagado\"}")]
+    [InlineData("{\"LightProfiles\":null,\"LightProfileActive\":null}")]
+    public void RecuperaListaAusenteOuVazia(string json)
+    {
+        var settings = JsonSerializer.Deserialize<AppSettings>(json)!;
+        Assert.Equal("Padrão", LightProfiles.Active(settings).Name);
+        Assert.Single(settings.LightProfiles);
+    }
+
+    [Fact]
+    public void AlterarOutroPerfilPreservaAtivo()
+    {
+        var settings = new AppSettings();
+        var original = LightProfiles.Active(settings);
+        var active = LightProfiles.Create(settings, "Jogo");
+        LightProfiles.Rename(settings, original, "Dia");
+        Assert.Same(active, LightProfiles.Active(settings));
+        LightProfiles.Delete(settings, original);
+        Assert.Same(active, LightProfiles.Active(settings));
+    }
+
+    [Fact]
     public void SaveProfileTemCabecalhoETerminadorDoProtocolo()
     {
         byte[] packet = OpenRgbBackend.BuildSaveProfilePacket("ResetExplode");
